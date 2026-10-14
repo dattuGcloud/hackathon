@@ -26,6 +26,7 @@ import re
 import sys
 import time
 import unicodedata
+import uuid
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,10 +61,13 @@ Output ONLY the transcribed text. Do not add markdown code blocks or conversatio
 
 def ocr_image(path: Path) -> OcrResult:
     from google import genai
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     client = genai.Client()
-    image = Image.open(path)
+    with Image.open(path) as src:
+        # Phone photos carry EXIF rotation; an un-rotated (sideways) page badly degrades handwriting OCR
+        image = ImageOps.exif_transpose(src)
+        image = image.convert("RGB") if image.mode not in ("RGB", "L") else image.copy()
     # Fallback chain across Flash models to prevent 503 high-demand failures
     models_to_try = ["gemini-2.5-flash", "gemini-3.1-flash-lite", "gemini-3.8-flash"]
     last_err = None
@@ -74,11 +78,16 @@ def ocr_image(path: Path) -> OcrResult:
                 response = client.models.generate_content(
                     model=model_name,
                     contents=[OCR_PROMPT, image],
+                    # Deterministic decoding: transcription must not be "creative"
+                    config={"temperature": 0.0},
                 )
+                if not response.text or not response.text.strip():
+                    raise RuntimeError(f"{model_name} returned an empty transcription")
                 return OcrResult(text=response.text.strip(), confidence=95.0, engine=model_name)
             except Exception as e:
                 last_err = e
-                if "503" in str(e) or "UNAVAILABLE" in str(e).upper():
+                err = str(e).upper()
+                if any(code in err for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
                     time.sleep(1.5 * (attempt + 1))
                     continue
                 break
@@ -95,7 +104,10 @@ def parse_pdf(path: Path) -> str:
                 pages_text.append(f"\n--- PAGE {i} ---\n{extracted}")
     except Exception as e:
         raise RuntimeError(f"PDF parsing failed: {e}")
-    return "\n".join(pages_text).strip()
+    text = "\n".join(pages_text).strip()
+    if not text:
+        raise RuntimeError("PDF contains no extractable text (scanned/image-only or encrypted report); upload a text-based PDF.")
+    return text
 
 
 # =========================================================================== #
@@ -139,16 +151,27 @@ PGX_GENES = {
 }
 
 # Strict biological grammar patterns
-METABOLIZER_RX = re.compile(r"\b(PM|IM|EM|NM|UM|Poor|Intermediate|Extensive|Normal|Ultrarapid)\b", re.I)
+METABOLIZER_RX = re.compile(
+    r"\b(PM|IM|EM|NM|RM|UM|Poor|Intermediate|Extensive|Normal|Rapid|Ultra[\s-]?rapid)\b", re.I
+)
 STAR_ALLELE_RX = re.compile(r"(\*[0-9A-Za-z]{1,4}\s*/\s*\*[0-9A-Za-z]{1,4}|\b[1-9][A-Za-z]?\s*/\s*[1-9][A-Za-z]?\b)")
+# Lookarounds instead of \b: "L(A)/L(A)" ends in ")" which never satisfies a trailing \b
 DIPLOTYPE_RX = re.compile(
-    r"\b("
-    r"L\(A\)/L\(A\)|L\(A\)/S|S/S|"
+    r"(?<![A-Za-z0-9])("
+    r"L\([AG]\)/L\([AG]\)|L\([AG]\)/S|S/L\([AG]\)|L/L|L/S|S/S|"
     r"Val/Val|Val/Met|Met/Met|"
     r"[ACGT]/[ACGT]|"
     r"Positive|Negative"
-    r")\b"
+    r")(?![A-Za-z0-9])"
 )
+# Phenotype vocabulary that makes a result clinically actionable (word-bounded, so "low" != "follow")
+ACTIONABLE_RX = re.compile(
+    r"\b(poor|(?:low|decreased|reduced)(?!\s+risk)|deficien\w*|no\s+function|intermediate|rapid|ultra[\s-]?rapid|"
+    r"increased\s+risk|positive|high\s+weight|high\s+activity)\b",
+    re.I,
+)
+PDF_PAGE_MARKER_RX = re.compile(r"\n?--- PAGE \d+ ---\n?")
+SECTION_HEADING_RX = re.compile(r"(?m)^[ \t]*(?:I|II|III|IV|V|VI|VII|VIII)\.\s+[A-Z]")
 MTHFR_LOCUS_RX = re.compile(r"(C677T\s*:\s*[ACGT]/[ACGT]|A1298C\s*:\s*[ACGT]/[ACGT])", re.I)
 BRACKET_ACT_RX = re.compile(r"\[([^\]]{3,45})\]")
 
@@ -158,20 +181,35 @@ def _clean_pgx_sections(raw_pdf_text: str) -> str:
     Slices out Section V (Test Methodology & Literature References) and Section III/IV Drug Tables
     so NER never extracts assay lists (*1B, *1C...) or bibliography numbers (247-252).
     """
+    text = PDF_PAGE_MARKER_RX.sub("\n", raw_pdf_text)
+
+    def body_heading(pattern: str, start: int = 0) -> Optional[re.Match]:
+        """First real section heading matching `pattern` at/after `start`.
+        Table-of-contents entries are skipped: the next roman-numeral heading follows with nothing but
+        dot leaders / page numbers in between, whereas a real section has a body."""
+        # Prefer headings at a line start; fall back to inline ones (pypdf sometimes joins lines).
+        # (?<![IVX]) keeps "V." from matching inside "IV." / "VI." etc.
+        for rx in (re.compile(r"(?mi)^[ \t]*" + pattern), re.compile(r"(?i)(?<![A-Za-z])" + pattern)):
+            for hm in rx.finditer(text, start):
+                nxt = SECTION_HEADING_RX.search(text, hm.end())
+                if nxt and re.fullmatch(r"[\s.\d]*", text[hm.end() : nxt.start()]):
+                    continue
+                return hm
+        return None
+
     # Cut off everything at Section V (Test Methodology / Literature Reference)
-    cleaned = re.split(r"V\.\s+TEST\s+METHODOLOGY", raw_pdf_text, flags=re.I)[0]
+    v_m = body_heading(r"V\.\s+TEST\s+METHODOLOGY")
+    cleaned = text[: v_m.start()] if v_m else text
     # Re-append Section VI (Patient Drug Metabolism Card) if present after Section V
-    card_match = re.search(r"(VI\.\s+PATIENT\s+DRUG\s+METABOLISM\s+CARD.*)", raw_pdf_text, flags=re.I | re.S)
-    if card_match:
-        cleaned += "\n" + card_match.group(1)
+    card_m = body_heading(r"VI\.\s+PATIENT\s+DRUG\s+METABOLISM\s+CARD", v_m.end() if v_m else 0)
+    card = text[card_m.start() :] if card_m and (not v_m or card_m.start() > v_m.start()) else ""
 
     # Also remove Section III & IV (Gene Drug Interaction Summary & Diagnosis Summary) to isolate gene result blocks
-    cleaned = re.sub(
-        r"III\.\s+GENE\s+DRUG\s+INTERACTION\s+SUMMARY.*?(?=VI\.\s+PATIENT\s+DRUG\s+METABOLISM\s+CARD|$)",
-        "\n",
-        cleaned,
-        flags=re.I | re.S,
-    )
+    iii_m = body_heading(r"III\.\s+GENE\s+DRUG\s+INTERACTION\s+SUMMARY")
+    if iii_m and iii_m.start() < len(cleaned):
+        cleaned = cleaned[: iii_m.start()] + "\n"
+    if card:
+        cleaned += "\n" + card
     return cleaned
 
 
@@ -211,9 +249,12 @@ def extract_pgx_ner(raw_pdf_text: str) -> List[dict]:
 
         # Inspect a tight 140-character window immediately following the gene name
         window = target_text[m.end() : m.end() + 140]
-        # Stop window if another gene header starts inside it (except CYP3A5 right after CYP3A4)
+        # Stop window if another gene header starts inside it (except a combined "CYP3A4 / CYP3A5" header,
+        # i.e. CYP3A5 immediately after CYP3A4; otherwise CYP3A4 would inherit CYP3A5's genotype)
         next_g = gene_header_rx.search(window)
-        if next_g and not (gene_name == "CYP3A4" and "CYP3A5" in next_g.group(0)):
+        if next_g and not (
+            gene_name == "CYP3A4" and "CYP3A5" in next_g.group(0) and re.fullmatch(r"[\s/&,+-]*", window[: next_g.start()])
+        ):
             window = window[: next_g.start()]
 
         # Reject prose mentions (e.g., "is a receptor...", "liver enzyme can result in...")
@@ -250,7 +291,7 @@ def extract_pgx_ner(raw_pdf_text: str) -> List[dict]:
 
         phenotype_code = met_m.group(1) if met_m else None
         if phenotype_code:
-            p_up = phenotype_code.upper()
+            p_up = re.sub(r"[\s-]+", "", phenotype_code.upper())
             phenotype_code = {
                 "PM": "Poor Metabolizer (PM)",
                 "POOR": "Poor Metabolizer (PM)",
@@ -261,6 +302,9 @@ def extract_pgx_ner(raw_pdf_text: str) -> List[dict]:
                 "NM": "Normal Metabolizer (NM)",
                 "NORMAL": "Normal Metabolizer (NM)",
                 "UM": "Ultrarapid Metabolizer (UM)",
+                "ULTRARAPID": "Ultrarapid Metabolizer (UM)",
+                "RM": "Rapid Metabolizer (RM)",
+                "RAPID": "Rapid Metabolizer (RM)",
             }.get(p_up, phenotype_code)
 
         # Validation Gate: Must have at least a valid biological genotype OR bracketed activity
@@ -269,10 +313,7 @@ def extract_pgx_ner(raw_pdf_text: str) -> List[dict]:
 
         # Determine if this variant is clinically actionable (non-normal)
         combined_status = " | ".join(filter(None, [phenotype_code, activity]))
-        actionable = any(
-            kw in (combined_status + " " + (genotype or "")).lower()
-            for kw in ["poor", "low", "decreased", "increased risk", "positive", "high weight", "high activity"]
-        )
+        actionable = bool(ACTIONABLE_RX.search(combined_status + " " + (genotype or "")))
 
         base_gene = "ABCB1" if gene_name.startswith("ABCB1") else gene_name
         category = PGX_GENES.get(base_gene, "Pharmacogenomic")
@@ -298,18 +339,35 @@ def extract_pgx_ner(raw_pdf_text: str) -> List[dict]:
 # 3. Clinical Prescription NLP & Fuzzy Pharmaceutical Lexicon (>90% Accuracy)
 # =========================================================================== #
 # Maps common Indian prescription brands (and frequent OCR misreads) to generic composition
+# Variant brands (-LP, -LC, -CD, -D, strengths) are separate entries: their compositions differ, and the
+# resolver picks the LONGEST matching alias, so "Montair-LC" never falls back to plain "Montair".
 INDIAN_RX_KB = [
-    ("Sinarest", ["sinarest", "sinarst", "sinarest-lp"], "Paracetamol + Phenylephrine + Chlorpheniramine", "URI / Cold & Nasal Decongestant"),
-    ("Montair-LC", ["montair-lc", "montow-lc", "montair lc", "montek-lc", "montair"], "Montelukast + Levocetirizine", "Allergic Rhinitis / Bronchodilator"),
-    ("Grilinctus", ["grilinctus", "grilinctus-bm", "grilinctus-cd"], "Dextromethorphan + Chlorpheniramine + Guaifenesin", "Cough Suppressant / Expectorant"),
-    ("Clavam 625", ["clavam 625", "clanar 625", "clavam-625", "augmentin 625", "clavam"], "Amoxicillin 500mg + Clavulanic Acid 125mg", "Beta-Lactam Antibiotic"),
-    ("Hifenac-P", ["hifenac-p", "haufy-plx", "harfy-plx", "hifenac", "zerodol-p"], "Aceclofenac + Paracetamol (or Multivitamin B-Complex)", "NSAID Analgesic / Supportive"),
-    ("Razo-D", ["razo-d", "revgool-d", "rabicip-d", "pantocid-d", "pan-d", "omez-d"], "Rabeprazole + Domperidone", "PPI + Prokinetics (Antacid/GERD)"),
+    ("Sinarest", ["sinarest", "sinarst"], "Paracetamol + Phenylephrine + Chlorpheniramine", "URI / Cold & Nasal Decongestant"),
+    ("Sinarest-LP", ["sinarest-lp", "sinarest lp"], "Paracetamol + Phenylephrine + Levocetirizine", "URI / Cold & Nasal Decongestant"),
+    ("Montair-LC", ["montair-lc", "montow-lc", "montair lc", "montek-lc", "montek lc"], "Montelukast + Levocetirizine", "Allergic Rhinitis / Bronchodilator"),
+    ("Montair", ["montair", "montek"], "Montelukast", "Leukotriene Receptor Antagonist (Asthma / Allergic Rhinitis)"),
+    ("Grilinctus", ["grilinctus"], "Dextromethorphan + Chlorpheniramine + Guaifenesin", "Cough Suppressant / Expectorant"),
+    ("Grilinctus-BM", ["grilinctus-bm", "grilinctus bm"], "Bromhexine + Guaifenesin + Terbutaline + Menthol", "Mucolytic / Expectorant + Bronchodilator"),
+    ("Grilinctus-CD", ["grilinctus-cd", "grilinctus cd"], "Codeine Phosphate + Chlorpheniramine", "Opioid Antitussive (CYP2D6-activated prodrug)"),
+    ("Clavam 625", ["clavam 625", "clanar 625", "clavam-625", "augmentin 625"], "Amoxicillin 500mg + Clavulanic Acid 125mg", "Beta-Lactam Antibiotic"),
+    ("Clavam 375", ["clavam 375", "clavam-375", "augmentin 375"], "Amoxicillin 250mg + Clavulanic Acid 125mg", "Beta-Lactam Antibiotic"),
+    ("Clavam 1g", ["clavam 1g", "clavam 1000", "augmentin 1g", "augmentin 1000"], "Amoxicillin 875mg + Clavulanic Acid 125mg", "Beta-Lactam Antibiotic"),
+    ("Clavam", ["clavam", "clanar", "augmentin"], "Amoxicillin + Clavulanic Acid (strength not stated)", "Beta-Lactam Antibiotic"),
+    ("Hifenac-P", ["hifenac-p", "hifenac p", "haufy-plx", "harfy-plx"], "Aceclofenac + Paracetamol", "NSAID Analgesic / Supportive"),
+    ("Hifenac", ["hifenac"], "Aceclofenac", "NSAID Analgesic"),
+    ("Zerodol-P", ["zerodol-p", "zerodol p"], "Aceclofenac + Paracetamol", "NSAID Analgesic"),
+    ("Razo-D", ["razo-d", "revgool-d", "rabicip-d"], "Rabeprazole + Domperidone", "PPI + Prokinetics (Antacid/GERD)"),
+    ("Pan-D", ["pan-d", "pantocid-d"], "Pantoprazole + Domperidone", "PPI + Prokinetics (Antacid/GERD)"),
+    ("Omez-D", ["omez-d", "omez d"], "Omeprazole + Domperidone", "PPI + Prokinetics (Antacid/GERD)"),
     ("Ascoril-LS", ["ascoril-ls", "ascoryl-ls", "ascoril ls", "ascoril"], "Levosalbutamol + Ambroxol + Guaifenesin", "Mucolytic + Bronchodilator Syrup"),
     ("Duolin", ["duolin", "respule-duolin", "duolin respules"], "Ipratropium Bromide + Levosalbutamol", "Nebulizer Bronchodilator"),
     ("Budecort", ["budecort", "budecort respules"], "Budesonide", "Nebulizer Inhaled Corticosteroid"),
     ("Mometasone", ["monfurate", "momate", "mometasone"], "Mometasone Furoate", "Corticosteroid (Nasal/Topical)"),
 ]
+
+
+def _compact(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
 def resolve_indian_brand(raw_name: str) -> Tuple[str, Optional[str], Optional[str], float]:
@@ -318,14 +376,35 @@ def resolve_indian_brand(raw_name: str) -> Tuple[str, Optional[str], Optional[st
     if not q:
         return raw_name, None, None, 0.0
 
+    # Token runs (1-3 tokens, separators removed) make "Montair LC", "Montair-LC" and "MontairLC" equivalent
+    # while keeping word boundaries ("pan-d" must not match inside "span-dx").
+    tokens = [t for t in re.split(r"[^a-z0-9]+", raw_name.lower()) if t]
+    runs = {"".join(tokens[i:j]) for i in range(len(tokens)) for j in range(i + 1, min(i + 4, len(tokens) + 1))}
+
+    # 1. Exact alias hit: the longest (most specific) alias wins
+    exact, exact_len = None, 0
+    for entry in INDIAN_RX_KB:
+        for alias in entry[1]:
+            key = _compact(alias)
+            if key in runs and len(key) > exact_len:
+                exact, exact_len = entry, len(key)
+    if exact:
+        return exact[0], exact[2], exact[3], 0.98
+
+    # 2. Fuzzy: compare each token run against each full alias for OCR-misspelled brands (comparing only an
+    #    alias's first word would turn plain "Montek" into "Montek-LC")
     best_canon, best_gen, best_class, best_score = raw_name, None, None, 0.0
+    cand_runs = [r for r in runs if len(r) >= 4 and re.search(r"[a-z]{3}", r)]
     for canon, aliases, generic, drug_class in INDIAN_RX_KB:
         for alias in aliases:
-            if alias in raw_name.lower():
-                return canon, generic, drug_class, 0.98
-            sim = difflib.SequenceMatcher(None, q, alias.split()[0]).ratio()
-            if sim > best_score:
-                best_canon, best_gen, best_class, best_score = canon, generic, drug_class, sim
+            key = _compact(alias)
+            # Shorter keys need closer similarity to avoid matching ordinary words: a 6-7 letter brand
+            # tolerates one OCR substitution ("Duolim"), but not "Ascorbic" vs "Ascoril"
+            threshold = 0.72 if len(key) >= 8 else 0.83 if len(key) >= 6 else 0.86
+            for r in cand_runs:
+                sim = difflib.SequenceMatcher(None, r, key).ratio()
+                if sim >= threshold and sim > best_score:
+                    best_canon, best_gen, best_class, best_score = canon, generic, drug_class, sim
 
     if best_score >= 0.72:
         return best_canon, best_gen, best_class, round(best_score, 2)
@@ -334,51 +413,107 @@ def resolve_indian_brand(raw_name: str) -> Tuple[str, Optional[str], Optional[st
 
 # Line-level detectors
 DEMO_VITALS_RX = re.compile(
-    r"\b(name|age|sex|gender|date|address|wt|weight|ht|height|bp|spo2|temp|pulse|pr|rr)\b\s*[:\-=]",
+    r"\b(name|age(?:\s*/\s*(?:sex|gender))?|sex|gender|date|address|wt|weight|ht|height|bp|spo2|temp|pulse|pr|rr)\b\s*[:\-=]",
+    re.I,
+)
+# A clinical section that shares a line with demographics, e.g. "Age: 30  c/o fever x 3 days"
+INLINE_SECTION_RX = re.compile(
+    r"(?:^|\s)((?:c/o|h/o|k/c/o)\b|(?:rx|℞|adv(?:ice)?|inv(?:estigations?)?)\s*[:\-])", re.I
+)
+# One dose slot: 0/1/2 or a half (½ becomes "1⁄2" after NFKC)
+_DOSE = r"(?:1/2|1⁄2|½|[012])"
+SCHEDULE_RX = re.compile(
+    rf"(?<![\d/⁄])({_DOSE})\s*-\s*({_DOSE})\s*-\s*({_DOSE})(?:\s*-\s*({_DOSE}))?(?![\d/⁄])"
+)
+FREQ_RX = re.compile(r"\b(OD|QD|HS|BD|BID|TDS|TID|QID|QDS|SOS|PRN|STAT)\b", re.I)
+FREQ_PER_DAY = {"OD": 1, "QD": 1, "HS": 1, "STAT": 1, "BD": 2, "BID": 2, "TDS": 3, "TID": 3, "QID": 4, "QDS": 4}
+DURATION_RX = re.compile(
+    r"\(?\s*(?:(?<![A-Za-z])x|×|\bfor)\s*\d+\s*(?:days?|d|wks?|w|weeks?|months?|mths?)\b\s*\)?"
+    r"|\(?\s*\b\d+\s*(?:days?|wks?|weeks?|months?|mths?)\b\s*\)?"
+    r"|\b(?:before|after|with)\s+(?:food|meals?|breakfast|lunch|dinner)\b|\b(?:a/c|p/c|empty\s+stomach)",
     re.I,
 )
 MED_LINE_RX = re.compile(
-    r"(?:^\s*(?:\d+\s*[).:-]?\s*)?(?:t|tab|cap|syp|susp|inj|oint|respules?|nebulizer|drops?)\b[\s\-:.]+)"
-    r"|(?:\b[012]\s*-\s*[012]\s*-\s*[012]\b)"
+    r"(?:^\s*(?:\d+\s*[).:-]?\s*)?(?:t|tab|cap|syp|syr|susp|inj|oint|respules?|nebulizer|drops?|gel|cream|sachet)\b[\s\-:.]+)"
+    rf"|(?:(?<![\d/⁄]){_DOSE}\s*-\s*{_DOSE}\s*-\s*{_DOSE}(?![\d/⁄]))"
     r"|(?:\b\d+\s*(?:mg|mcg|ml)\b)",
     re.I,
 )
-SCHEDULE_RX = re.compile(r"\b([012])\s*-\s*([012])\s*-\s*([012])\b")
 QTY_RX = re.compile(r"\((\d+\s*(?:ml|tabs?|caps?)?)\)", re.I)
 FORM_PREFIX_RX = re.compile(
-    r"^\s*(?:\d+\s*[).:-]?\s*)?(?P<form>t|tab|tablet|cap|capsule|syp|syrup|susp|suspension|inj|respules?)\b[\s\-:.]*",
+    r"^\s*(?:\d+\s*[).:-]?\s*)?(?P<form>t|tab|tablet|cap|capsule|syp|syr|syrup|susp|suspension|inj|respules?|"
+    r"oint|ointment|drops?|gel|cream|sachet)\b[\s\-:.]*",
     re.I,
 )
 INVESTIGATION_KEYWORDS = re.compile(
-    r"\b(x-?ray|chest\s+x-?ray|sputum\s+for\s+\(?afb\)?|afb|cbc|ecg|usg|ct\s+scan|mri|lft|rft|hba1c|urine\s+routine|blood\s+sugar)\b",
+    r"\b(x-?ray|chest\s+x-?ray|sputum\s+for\s+\(?afb\)?|afb|cbc|ecg|usg|ct\s+scan|mri|lft|rft|kft|hba1c|"
+    r"urine\s+routine|blood\s+sugar|fbs|rbs|ppbs|tsh|esr|crp|widal|ns1|lipid\s+profile|serum\s+creatinine|2d\s+echo)\b",
     re.I,
 )
+# "h/o high blood sugar" is a disease history, not a lab order
+HISTORY_CONTEXT_RX = re.compile(r"\b(known|k/c/o|high|raised|elevated|diabet\w*|hypertensi\w*|since|years?|yrs?)\b", re.I)
+# (?![A-Za-z]) stops headers matching the start of ordinary words ("Cough" != "c/o", "Medrol" != "Med")
 SECTION_HEADER_RX = [
-    ("meds", re.compile(r"^\s*(?:r/?x|℞|medications?|meds?|treatment)\s*[:\-]?\s*(.*)$", re.I)),
-    ("investigations", re.compile(r"^\s*(?:investigations?|inv|lab\s+orders?|tests?)\s*[:\-]?\s*(.*)$", re.I)),
-    ("advice", re.compile(r"^\s*(?:advice|advised|instructions?|nebulization)\s*[:\-]?\s*(.*)$", re.I)),
-    ("history", re.compile(r"^\s*(?:h/?o|k/?c/?o|pmh|past\s+history)\s*[:\-]?\s*(.*)$", re.I)),
-    ("symptoms", re.compile(r"^\s*(?:c/?o|cc|complaints?|symptoms?|presenting)\s*[:\-]?\s*(.*)$", re.I)),
-    ("allergies", re.compile(r"^\s*(?:allerg(?:y|ies)|nkda|nka)\s*[:\-]?\s*(.*)$", re.I)),
+    ("meds", re.compile(r"^\s*(?:r/?x|℞|medications?|meds?|treatment)(?![A-Za-z])\s*[:\-]?\s*(.*)$", re.I)),
+    ("investigations", re.compile(r"^\s*(?:investigations?|inv|lab\s+orders?|tests?)(?![A-Za-z])\s*[:\-]?\s*(.*)$", re.I)),
+    ("advice", re.compile(r"^\s*(?:advice|advised|adv|instructions?|nebulization)(?![A-Za-z])\s*[:\-]?\s*(.*)$", re.I)),
+    ("history", re.compile(r"^\s*(?:h/?o|k/?c/?o|pmh|past\s+history)(?![A-Za-z])\s*[:\-]?\s*(.*)$", re.I)),
+    ("symptoms", re.compile(r"^\s*(?:c/?o|cc|complaints?|symptoms?|presenting)(?![A-Za-z])\s*[:\-]?\s*(.*)$", re.I)),
+    ("allergies", re.compile(r"^\s*(?:allerg(?:y|ies)|nkda|nka)(?![A-Za-z])\s*[:\-]?\s*(.*)$", re.I)),
 ]
 
 
 def parse_demographics_and_vitals(text: str) -> dict:
     info: Dict[str, object] = {}
-    if m := re.search(r"\bName\s*[:\-]\s*([A-Za-z][A-Za-z .'-]{1,30}?)(?=\s+(?:Age|Sex|Date|Address|\n)|$)", text, re.I):
+    if m := re.search(
+        r"\bName\s*[:\-]\s*([A-Za-z][A-Za-z .'-]{1,30}?)(?=[ \t]+(?:Age|Sex|Gender|Date|Address|Wt|Weight)\b|[ \t]*(?:\n|$))",
+        text,
+        re.I,
+    ):
         info["name"] = m.group(1).strip()
-    if m := re.search(r"\bAge\s*[:\-]?\s*(\d{1,3})\s*(?:y|yrs?|years?)?\b", text, re.I):
-        info["age_years"] = int(m.group(1))
-    if m := re.search(r"\b(?:Sex|Gender)\s*[:\-]?\s*(M|F|Male|Female)\b", text, re.I):
+    # Age with unit: months/weeks/days must not be read as years (paediatric dosing depends on it)
+    age_m = re.search(
+        r"\bAge(?:\s*/\s*(?:Sex|Gender))?\s*[:\-]?\s*(\d{1,3})"
+        r"(?P<unit>\s*(?:yrs?|years?|y)\b|\s*(?:mo|mos|mths?|months?)\b|m(?![A-Za-z])|\s*(?:wks?|weeks?)\b|\s*(?:days?)\b)?",
+        text,
+        re.I,
+    )
+    # Fallback "45/M", "45 yrs / F" (age/sex written together without labels)
+    age_sex_m = re.search(r"(?<![\d/])(\d{1,3})\s*(?:y|yrs?|years?)?\s*/\s*(M|F|Male|Female)\b", text, re.I)
+    if age_m:
+        n, unit = int(age_m.group(1)), (age_m.group("unit") or "").strip().lower()
+        # A bare attached "m" ("18m") is months for infants; "45M" is far more likely 45 yrs / Male
+        if unit.startswith("m") and (unit != "m" or n < 24):
+            info["age_years"] = n // 12
+        elif unit.startswith(("w", "d")):
+            info["age_years"] = 0
+        else:
+            info["age_years"] = n
+    elif age_sex_m:
+        info["age_years"] = int(age_sex_m.group(1))
+    if m := re.search(r"\b(?:Sex|Gender)\s*[:\-]?\s*(?:\d{1,3}\s*\w*\s*/\s*)?(M|F|Male|Female)\b", text, re.I):
         info["sex"] = "Male" if m.group(1).upper().startswith("M") else "Female"
+    elif age_sex_m:
+        info["sex"] = "Male" if age_sex_m.group(2).upper().startswith("M") else "Female"
     if m := re.search(r"\bDate\s*[:\-]?\s*(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4})", text, re.I):
         info["date"] = m.group(1)
     if m := re.search(r"\bAddress\s*[:\-]?\s*([A-Za-z0-9 ,.-]{2,40})", text, re.I):
         info["location"] = m.group(1).strip()
-    if m := re.search(r"\b(\d{2,3}/\d{2,3})\s*(?:mmhg)?\b", text, re.I):
-        info["bp"] = m.group(1)
-    if m := re.search(r"\b(9\d(?:\.\d)?)\s*°?\s*F\b", text, re.I):
+    # BP: prefer an explicit "BP" label; otherwise a plausible x/y that is not part of a date (12/10/2026)
+    bp_m = re.search(r"\bB\.?P\.?\s*[:\-=]?\s*(\d{2,3})\s*/\s*(\d{2,3})\b", text, re.I)
+    if not bp_m:
+        for cand in re.finditer(r"(?<![\d/.\-])(\d{2,3})\s*/\s*(\d{2,3})(?![\d/.\-])", text):
+            if 60 <= int(cand.group(1)) <= 260 and 30 <= int(cand.group(2)) <= 160 and int(cand.group(1)) > int(cand.group(2)):
+                bp_m = cand
+                break
+    if bp_m:
+        info["bp"] = f"{bp_m.group(1)}/{bp_m.group(2)}"
+    # Temperature: 90-109 °F (fever >= 100.4 included); a labelled Celsius reading is converted
+    if m := re.search(r"\b((?:9\d|10\d)(?:\.\d)?)\s*°?\s*F\b", text, re.I):
         info["temperature_f"] = float(m.group(1))
+    elif m := re.search(r"\bTemp(?:erature)?\s*[:\-=]?\s*(\d{2}(?:\.\d)?)\s*°?\s*C\b", text, re.I):
+        if 34 <= float(m.group(1)) <= 43:
+            info["temperature_f"] = round(float(m.group(1)) * 9 / 5 + 32, 1)
     return info
 
 
@@ -386,9 +521,11 @@ def parse_med_line(line: str) -> dict:
     form_map = {
         "t": "Tablet", "tab": "Tablet", "tablet": "Tablet",
         "cap": "Capsule", "capsule": "Capsule",
-        "syp": "Syrup", "syrup": "Syrup",
+        "syp": "Syrup", "syr": "Syrup", "syrup": "Syrup",
         "susp": "Suspension", "suspension": "Suspension",
         "inj": "Injection", "respule": "Respule (Nebulizer)", "respules": "Respule (Nebulizer)",
+        "oint": "Ointment", "ointment": "Ointment", "drop": "Drops", "drops": "Drops",
+        "gel": "Gel", "cream": "Cream", "sachet": "Sachet",
     }
     form = None
     work = line.strip()
@@ -400,16 +537,25 @@ def parse_med_line(line: str) -> dict:
 
     schedule, per_day = None, None
     if sm := SCHEDULE_RX.search(work):
-        digits = [int(sm.group(1)), int(sm.group(2)), int(sm.group(3))]
-        schedule = f"{digits[0]}-{digits[1]}-{digits[2]}"
-        per_day = sum(digits)
+        slots = [g for g in sm.groups() if g is not None]
+        doses = [0.5 if s in ("1/2", "1⁄2", "½") else int(s) for s in slots]
+        schedule = "-".join("½" if d == 0.5 else str(d) for d in doses)
+        total = sum(doses)
+        per_day = int(total) if float(total).is_integer() else total
         work = work[: sm.start()] + " " + work[sm.end() :]
+    elif fq := FREQ_RX.search(work):
+        schedule = fq.group(1).upper()
+        per_day = FREQ_PER_DAY.get(schedule)
+        work = work[: fq.start()] + " " + work[fq.end() :]
 
     quantity = None
     if qm := QTY_RX.search(work):
         quantity = qm.group(1).strip()
         work = work[: qm.start()] + " " + work[qm.end() :]
 
+    # Remaining frequency words, durations ("x 5 days") and food timing are not part of the drug name
+    work = FREQ_RX.sub(" ", work)
+    work = DURATION_RX.sub(" ", work)
     raw_drug = re.sub(r"\s+", " ", work).strip(" -.,()")
     canon_brand, generic, drug_class, conf = resolve_indian_brand(raw_drug)
 
@@ -425,6 +571,26 @@ def parse_med_line(line: str) -> dict:
         "quantity_or_volume": quantity,
         "confidence": conf,
     }
+
+
+ADVICE_WORDS_RX = re.compile(
+    r"\b(steam|gargles?|inhalation|rest|diet|avoid|drink|water|fluids?|review|follow|revisit|plenty|warm|salt)\b", re.I
+)
+
+
+def _split_combined_meds(line: str) -> List[dict]:
+    """'Duolin + Budecort respules 1-1-1' -> one record per known brand (schedule shared);
+    falls back to a single record when the parts are not all recognised brands."""
+    parts = [p for p in re.split(r"\s*(?:\+|&|,|\band\b)\s*", line, flags=re.I) if p.strip()]
+    if len(parts) > 1 and all(resolve_indian_brand(re.sub(r"\(.*?\)", "", p))[3] == 0.98 for p in parts):
+        shared = SCHEDULE_RX.search(line) or FREQ_RX.search(line)
+        out = []
+        for p in parts:
+            if shared and not (SCHEDULE_RX.search(p) or FREQ_RX.search(p)):
+                p = f"{p} {shared.group(0)}"
+            out.append(parse_med_line(p))
+        return out
+    return [parse_med_line(line)]
 
 
 def parse_clinical_note(raw_text: str) -> dict:
@@ -446,8 +612,12 @@ def parse_clinical_note(raw_text: str) -> dict:
             continue
 
         # 1. Strip pure demographic/vital lines so they never pollute symptoms
+        #    (but keep a clinical section written on the same line, e.g. "Age: 30  c/o fever")
         if DEMO_VITALS_RX.search(line):
-            continue
+            inline = INLINE_SECTION_RX.search(line)
+            if not inline:
+                continue
+            line = line[inline.start(1) :].strip()
 
         # 2. Check for explicit section header transitions (with or without colon)
         header_matched = False
@@ -457,6 +627,8 @@ def parse_clinical_note(raw_text: str) -> dict:
                 current_section = sec_name
                 remainder = m.group(1).strip()
                 header_matched = True
+                if sec_name == "allergies" and re.match(r"^\s*nkda?\b", line, re.I):
+                    allergies.append("NKDA (no known drug allergies)")
                 if remainder:
                     line = remainder
                     break
@@ -467,7 +639,11 @@ def parse_clinical_note(raw_text: str) -> dict:
             continue
 
         # 3. Line-Morphology Override: Check if line is an Investigation
-        if INVESTIGATION_KEYWORDS.search(line):
+        #    (unless it is a disease history such as "h/o high blood sugar since 5 yrs")
+        if INVESTIGATION_KEYWORDS.search(line) and not (
+            (current_section == "history" or re.match(r"^\s*(?:h/?o|k/?c/?o)\b", raw_line.strip(), re.I))
+            and HISTORY_CONTEXT_RX.search(line)
+        ):
             clean_inv = re.sub(r"^(?:h/?o|investigation\s*[:\-]?)\s*", "", line, flags=re.I).strip()
             if clean_inv and clean_inv not in investigations:
                 investigations.append(clean_inv)
@@ -477,7 +653,7 @@ def parse_clinical_note(raw_text: str) -> dict:
         if re.search(r"\b(nebulizer|respules?|duolin|budecort)\b", line, re.I):
             advice.append(re.sub(r"^\s*\d+\s*[).:-]\s*", "", line))
             if re.search(r"\b(duolin|budecort|respules?)\b", line, re.I):
-                medications.append(parse_med_line(line))
+                medications.extend(_split_combined_meds(line))
             continue
 
         # 5. Line-Morphology Override: Check if line is a Medication (by prefix T-/Cap-/Susp- or 1-0-1 schedule)
@@ -491,7 +667,13 @@ def parse_clinical_note(raw_text: str) -> dict:
             continue
 
         # 7. Route remaining clinical lines by active section
-        if current_section == "allergies":
+        if current_section == "meds":
+            # Under Rx, an un-prefixed line is a drug ("Montair LC") unless it is clearly an instruction
+            if resolve_indian_brand(line)[3] >= 0.72 or not ADVICE_WORDS_RX.search(line):
+                medications.append(parse_med_line(line))
+            else:
+                advice.append(line)
+        elif current_section == "allergies":
             allergies.append(line)
         elif current_section == "history":
             history.append({"raw": line, "negated": bool(re.match(r"^(?:no|nil|denies)\b", line, re.I))})
@@ -501,15 +683,21 @@ def parse_clinical_note(raw_text: str) -> dict:
         elif current_section == "advice":
             advice.append(line)
         else:
-            # Fix common cursive shorthand misread on prescriptions (e.g. "40 Gark" -> "c/o Cough / Cold")
-            cleaned_sym = re.sub(r"^40\s+", "c/o ", line)
+            # Fix common cursive shorthand misread on prescriptions (e.g. "40 Gark" -> "c/o Cough / Cold");
+            # only when "40" is followed by a word, never a dose/unit/number
+            cleaned_sym = re.sub(r"^40\s+(?=[A-Za-z]{3})(?!(?:mg|mcg|ml|kg|yrs?|years?|days?)\b)", "c/o ", line, flags=re.I)
+            negated = bool(re.match(r"^(?:no|nil|denies)\b", line, re.I))
+            # Infer URTI only from an affirmed cough/cold ("no cough" must not produce a diagnosis)
+            urti = re.search(r"gark|smafly|cough|cold", line, re.I) and not negated and not re.search(
+                r"\b(?:no|nil|denies)\s+(?:\w+\s+){0,2}?(?:cough|cold)", line, re.I
+            )
             symptoms.append({
                 "raw": line,
                 "cleaned": cleaned_sym,
                 "clinical_interpretation": "Upper Respiratory Tract Infection / Cough & Rhinitis (inferred from regimen)"
-                if re.search(r"gark|smafly|cough|cold", line, re.I)
+                if urti
                 else cleaned_sym,
-                "negated": bool(re.match(r"^(?:no|nil|denies)\b", line, re.I)),
+                "negated": negated,
             })
 
     return {
@@ -550,10 +738,13 @@ def generate_rag_payload(clinical_text: str, pgx_text: str, ocr_engine: str) -> 
     # Build High-Signal RAG Search Queries
     rag_queries = []
     if med_summaries or sym_summaries:
+        age = f"{demo['age_years']}-year-old" if "age_years" in demo else "age-unstated"
+        sex = str(demo.get("sex", "patient")).lower()
+        inv_clause = f" with investigations ordered: {', '.join(ents['investigations'])}" if ents["investigations"] else ""
         rag_queries.append({
             "id": "Q1_clinical_regimen_review",
             "intent": "indication_and_dosing_verification",
-            "query": f"Verify clinical appropriateness, dosing, and duplicate therapy for {', '.join(med_summaries)} in a {demo.get('age_years', 'adult')}yo {demo.get('sex', 'patient')} presenting with {', '.join(sym_summaries) or 'respiratory symptoms'} and ordered {', '.join(ents['investigations'])}.",
+            "query": f"Verify clinical appropriateness, dosing, and duplicate therapy for {', '.join(med_summaries) or 'no prescribed medications'} in a {age} {sex} presenting with {', '.join(sym_summaries) or 'unstated complaints'}{inv_clause}.",
         })
     if actionable_pgx:
         pgx_terms = [f"{p['gene']} {p['genotype']} ({p['phenotype']})" for p in actionable_pgx]
@@ -563,17 +754,26 @@ def generate_rag_payload(clinical_text: str, pgx_text: str, ocr_engine: str) -> 
             "query": f"CPIC and FDA pharmacogenomic dosing guidelines and drug contraindications for {', '.join(pgx_terms)}.",
         })
     if med_summaries and pgx_entities:
+        # Built only from THIS patient's results and regimen (never from example genotypes)
+        cross_genes = actionable_pgx or pgx_entities
+        gene_terms = [f"{p['gene']} {p['phenotype']} ({p['genotype']})" for p in cross_genes]
+        generics: List[str] = []
+        for m in ents["medications"]:
+            for g in re.split(r"\s*\+\s*", re.sub(r"\(.*?\)", "", m["generic_composition"] or m["written_name"])):
+                g = re.sub(r"\s*\d+\s*(?:mg|mcg|g)\b", "", g).strip()
+                if g and g not in generics:
+                    generics.append(g)
         rag_queries.append({
             "id": "Q3_drug_gene_cross_check",
             "intent": "regimen_pgx_interaction",
-            "query": f"Check CYP2D6 Poor Metabolizer (*4/*4) and CYP2B6 Poor Metabolizer (*6/*6) interactions with prescribed regimen: {', '.join(med_summaries)} (specifically Dextromethorphan in Grilinctus, Chlorpheniramine, Levocetirizine, Rabeprazole, Amoxicillin/Clavulanate).",
+            "query": f"Check {', '.join(gene_terms)} interactions with prescribed regimen: {', '.join(med_summaries)} (specifically {', '.join(generics)}).",
         })
 
     # Build Prompt-Ready Context Block
     context_lines = [
         "[PATIENT DEMOGRAPHICS & CLINICAL CONTEXT - OCR-DERIVED]",
         f"Patient: {demo.get('name', 'Unstated')} | Age: {demo.get('age_years', 'Unstated')} | Sex: {demo.get('sex', 'Unstated')} | Location: {demo.get('location', 'Unstated')} | Date: {demo.get('date', 'Unstated')}",
-        f"Presenting Complaints: {'; '.join(sym_summaries) or 'Inferred acute respiratory presentation'}",
+        f"Presenting Complaints: {'; '.join(sym_summaries) or 'None stated'}",
         f"Diagnostic Investigations Ordered: {'; '.join(ents['investigations']) or 'None'}",
         f"Prescribed Medications ({len(ents['medications'])}): " + ("; ".join(med_summaries) or "None"),
         f"Nebulization / Clinical Advice: {'; '.join(ents['advice_and_procedures']) or 'None'}",
@@ -594,9 +794,9 @@ def generate_rag_payload(clinical_text: str, pgx_text: str, ocr_engine: str) -> 
         },
         "rag_instructions": [
             "Treat every OCR-derived clinical fact as unconfirmed and verify brand-to-generic mappings.",
-            "Prioritize [ACTIONABLE ALERT] pharmacogenomic variants (e.g., CYP2D6 PM *4/*4, CYP2B6 PM *6/*6, HLA-A*31:01 Positive).",
-            "Flag any prescribed medication metabolized by a Poor Metabolizer enzyme (e.g., Dextromethorphan in Grilinctus is a major CYP2D6 substrate).",
-            "Never recommend carbamazepine if HLA-A*31:01 is Positive.",
+            "Prioritize the [ACTIONABLE ALERT] pharmacogenomic variants listed in this patient's PGx profile; do not assume genotypes that are not listed.",
+            "Flag any prescribed medication that is a substrate (or prodrug) of an enzyme with a Poor, Intermediate, Rapid or Ultrarapid phenotype in this profile.",
+            "Never recommend carbamazepine if HLA-A*31:01 or HLA-B*15:02 is Positive.",
         ],
         "segregated_data": {
             "clinical_note": {
@@ -690,10 +890,13 @@ def render_audit_tables(payload: dict) -> str:
     )
 
 
+UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
-    os.makedirs("uploads", exist_ok=True)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
 
     @app.route("/", methods=["GET", "POST"])
     def index():
@@ -703,22 +906,25 @@ def create_app() -> Flask:
         clinical_file = request.files.get("clinical_image")
         pgx_file = request.files.get("pgx_pdf")
         clinical_text, pgx_text, ocr_engine = "", "", "none"
+        # Unique per-request names: concurrent uploads must never overwrite each other's files
+        req_id = uuid.uuid4().hex
+        temp_paths: List[Path] = []
 
         try:
             if clinical_file and clinical_file.filename:
                 ext = Path(clinical_file.filename).suffix.lower()
-                img_path = Path("uploads") / f"temp_img{ext}"
+                img_path = UPLOAD_DIR / f"temp_img_{req_id}{ext}"
+                temp_paths.append(img_path)
                 clinical_file.save(img_path)
                 ocr_res = ocr_image(img_path)
                 clinical_text, ocr_engine = ocr_res.text, ocr_res.engine
-                img_path.unlink(missing_ok=True)
 
             if pgx_file and pgx_file.filename:
                 ext = Path(pgx_file.filename).suffix.lower()
-                pdf_path = Path("uploads") / f"temp_pgx{ext}"
+                pdf_path = UPLOAD_DIR / f"temp_pgx_{req_id}{ext}"
+                temp_paths.append(pdf_path)
                 pgx_file.save(pdf_path)
                 pgx_text = parse_pdf(pdf_path)
-                pdf_path.unlink(missing_ok=True)
 
             if not clinical_text and not pgx_text:
                 return render_template_string(PAGE, body=Markup("<section><h2>Error</h2><p>Please upload at least one file.</p></section>"))
@@ -728,6 +934,10 @@ def create_app() -> Flask:
 
         except Exception as e:
             return render_template_string(PAGE, body=Markup(f"<section><h2>Processing Error</h2><p>{esc(str(e))}</p></section>")), 500
+        finally:
+            # Delete uploaded patient files even when OCR/parsing fails
+            for p in temp_paths:
+                p.unlink(missing_ok=True)
 
     return app
 
