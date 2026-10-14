@@ -969,6 +969,63 @@ def create_app() -> Flask:
     return app
 
 
+# =========================================================================== #
+# 6. n8n RAG / Clinical Safety Workflow Connection
+# =========================================================================== #
+# Sends the extraction payload built above to the n8n workflow and shows the returned
+# Clinical Safety Report under the extraction tables. The code above is unchanged: the route
+# in create_app() looks up render_audit_tables() by name at request time, so the wrapper
+# defined below is the one it calls (this section must stay above the __main__ block).
+import requests
+
+# Production webhook (the n8n workflow must be Active). Can be overridden with an env variable.
+N8N_PRODUCTION_WEBHOOK = os.environ.get(
+    "N8N_WEBHOOK_URL", "https://gudd.app.n8n.cloud/webhook/evaluate-patient-safety"
+)
+# Must stay below gunicorn's --timeout (120 s) so a slow workflow cannot kill the worker
+N8N_TIMEOUT_SECONDS = 100
+
+
+def send_to_rag_pipeline(parsed_json_payload: dict) -> dict:
+    """POST the intake payload to n8n and return its Clinical Safety Report (or an {"error": ...} dict)."""
+    try:
+        response = requests.post(N8N_PRODUCTION_WEBHOOK, json=parsed_json_payload, timeout=N8N_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        try:
+            report = response.json()
+        except ValueError:
+            # Webhook answered with plain text instead of JSON
+            report = {"report_text": response.text}
+        # n8n returns a list when "Respond With: All Incoming Items" is used; a single item is the report
+        if isinstance(report, list) and len(report) == 1:
+            report = report[0]
+        return report if isinstance(report, dict) else {"report": report}
+    except requests.exceptions.RequestException as e:
+        print(f"Error connecting to n8n RAG workflow: {e}")
+        return {"error": str(e)}
+
+
+def render_n8n_report(report: dict) -> str:
+    if "error" in report:
+        return (
+            "<section><h2>4. Clinical Safety Report (n8n)</h2>"
+            "<p><span class='badge bad'>n8n workflow unavailable</span></p>"
+            f"<p class='small muted'>{esc(report['error'])}</p>"
+            "<p class='small'>The extraction above is still valid; check that the n8n workflow is Active "
+            "and the webhook URL is correct.</p></section>"
+        )
+    report_str = esc(json.dumps(report, indent=2, ensure_ascii=False))
+    return f"<section><h2>4. Clinical Safety Report (n8n)</h2><pre>{report_str}</pre></section>"
+
+
+_extraction_tables = render_audit_tables
+
+
+def render_audit_tables(payload: dict) -> str:  # noqa: F811 - intentional wrapper of the section-5 renderer
+    """Extraction tables (unchanged) + the n8n Clinical Safety Report for the same payload."""
+    return _extraction_tables(payload) + render_n8n_report(send_to_rag_pipeline(payload))
+
+
 if __name__ == "__main__":
     port = 5000
     print(f"🚀 Starting Senior NLP Dual-Intake Server on http://127.0.0.1:{port}")
