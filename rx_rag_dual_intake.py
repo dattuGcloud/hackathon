@@ -16,10 +16,8 @@ Run:
 """
 from __future__ import annotations
 
-import base64
 import difflib
 import html
-import io
 import json
 import os
 import re
@@ -32,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, render_template_string, request
 from markupsafe import Markup
 
 try:
@@ -69,7 +67,8 @@ def ocr_image(path: Path) -> OcrResult:
         image = ImageOps.exif_transpose(src)
         image = image.convert("RGB") if image.mode not in ("RGB", "L") else image.copy()
     # Fallback chain across Flash models to prevent 503 high-demand failures
-    models_to_try = ["gemini-2.5-flash", "gemini-3.1-flash-lite", "gemini-3.8-flash"]
+    # (IDs verified against Google's published model list; gemini-3.6-flash is a GA last resort)
+    models_to_try = ["gemini-2.5-flash", "gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-3.6-flash"]
     last_err = None
 
     for model_name in models_to_try:
@@ -346,8 +345,8 @@ INDIAN_RX_KB = [
     ("Sinarest-LP", ["sinarest-lp", "sinarest lp"], "Paracetamol + Phenylephrine + Levocetirizine", "URI / Cold & Nasal Decongestant"),
     ("Montair-LC", ["montair-lc", "montow-lc", "montair lc", "montek-lc", "montek lc"], "Montelukast + Levocetirizine", "Allergic Rhinitis / Bronchodilator"),
     ("Montair", ["montair", "montek"], "Montelukast", "Leukotriene Receptor Antagonist (Asthma / Allergic Rhinitis)"),
-    ("Grilinctus", ["grilinctus"], "Dextromethorphan + Chlorpheniramine + Guaifenesin", "Cough Suppressant / Expectorant"),
-    ("Grilinctus-BM", ["grilinctus-bm", "grilinctus bm"], "Bromhexine + Guaifenesin + Terbutaline + Menthol", "Mucolytic / Expectorant + Bronchodilator"),
+    ("Grilinctus", ["grilinctus"], "Dextromethorphan + Chlorpheniramine + Guaifenesin + Ammonium Chloride", "Cough Suppressant / Expectorant"),
+    ("Grilinctus-BM", ["grilinctus-bm", "grilinctus bm"], "Bromhexine + Terbutaline", "Mucolytic + Bronchodilator"),
     ("Grilinctus-CD", ["grilinctus-cd", "grilinctus cd"], "Codeine Phosphate + Chlorpheniramine", "Opioid Antitussive (CYP2D6-activated prodrug)"),
     ("Clavam 625", ["clavam 625", "clanar 625", "clavam-625", "augmentin 625"], "Amoxicillin 500mg + Clavulanic Acid 125mg", "Beta-Lactam Antibiotic"),
     ("Clavam 375", ["clavam 375", "clavam-375", "augmentin 375"], "Amoxicillin 250mg + Clavulanic Acid 125mg", "Beta-Lactam Antibiotic"),
@@ -413,7 +412,9 @@ def resolve_indian_brand(raw_name: str) -> Tuple[str, Optional[str], Optional[st
 
 # Line-level detectors
 DEMO_VITALS_RX = re.compile(
-    r"\b(name|age(?:\s*/\s*(?:sex|gender))?|sex|gender|date|address|wt|weight|ht|height|bp|spo2|temp|pulse|pr|rr)\b\s*[:\-=]",
+    r"\b(name|age(?:\s*/\s*(?:sex|gender))?|sex|gender|date|address|wt|weight|ht|height|bp|spo2|temp|pulse|pr|rr)\b\s*[:\-=]"
+    # Vitals are often written without a separator: "SpO2 98%", "PR 88/min", "Wt 18 kg"
+    r"|\b(wt|weight|ht|height|bp|spo2|sp\s*o2|temp|pulse|pr|hr|rr)\b\s*\d",
     re.I,
 )
 # A clinical section that shares a line with demographics, e.g. "Age: 30  c/o fever x 3 days"
@@ -514,6 +515,23 @@ def parse_demographics_and_vitals(text: str) -> dict:
     elif m := re.search(r"\bTemp(?:erature)?\s*[:\-=]?\s*(\d{2}(?:\.\d)?)\s*°?\s*C\b", text, re.I):
         if 34 <= float(m.group(1)) <= 43:
             info["temperature_f"] = round(float(m.group(1)) * 9 / 5 + 32, 1)
+    # Weight drives paediatric (Susp-/Syp-) dose checks; lbs converted to kg
+    if m := re.search(r"\b(?:Wt|Weight)\s*[:\-=]?\s*(\d{1,3}(?:\.\d{1,2})?)\s*(kgs?|lbs?)?\b", text, re.I):
+        wt = float(m.group(1)) * (0.4536 if (m.group(2) or "").lower().startswith("lb") else 1)
+        if 0.5 <= wt <= 300:
+            info["weight_kg"] = round(wt, 1)
+    if m := re.search(r"\b(?:Ht|Height)\s*[:\-=]?\s*(\d{2,3}(?:\.\d)?)\s*cm\b", text, re.I):
+        if 30 <= float(m.group(1)) <= 250:
+            info["height_cm"] = float(m.group(1))
+    if m := re.search(r"\bSp\s*O2\s*[:\-=]?\s*(?:@\s*RA\s*)?(\d{2,3})\s*%?", text, re.I):
+        if 50 <= int(m.group(1)) <= 100:
+            info["spo2_percent"] = int(m.group(1))
+    if m := re.search(r"\b(?:Pulse|PR|HR)\s*[:\-=]?\s*(\d{2,3})\s*(?:/\s*min|bpm|b/m)?(?![\d/])", text, re.I):
+        if 30 <= int(m.group(1)) <= 250:
+            info["pulse_bpm"] = int(m.group(1))
+    if m := re.search(r"\bRR\s*[:\-=]?\s*(\d{1,2})\s*(?:/\s*min)?(?![\d/])", text, re.I):
+        if 5 <= int(m.group(1)) <= 80:
+            info["respiratory_rate"] = int(m.group(1))
     return info
 
 
@@ -773,6 +791,15 @@ def generate_rag_payload(clinical_text: str, pgx_text: str, ocr_engine: str) -> 
     context_lines = [
         "[PATIENT DEMOGRAPHICS & CLINICAL CONTEXT - OCR-DERIVED]",
         f"Patient: {demo.get('name', 'Unstated')} | Age: {demo.get('age_years', 'Unstated')} | Sex: {demo.get('sex', 'Unstated')} | Location: {demo.get('location', 'Unstated')} | Date: {demo.get('date', 'Unstated')}",
+        "Vitals: " + (" | ".join(
+            f"{label}: {demo[key]}{unit}"
+            for key, label, unit in (
+                ("weight_kg", "Weight", " kg"), ("height_cm", "Height", " cm"), ("bp", "BP", " mmHg"),
+                ("temperature_f", "Temp", " °F"), ("spo2_percent", "SpO2", "%"), ("pulse_bpm", "Pulse", "/min"),
+                ("respiratory_rate", "RR", "/min"),
+            )
+            if key in demo
+        ) or "None recorded"),
         f"Presenting Complaints: {'; '.join(sym_summaries) or 'None stated'}",
         f"Diagnostic Investigations Ordered: {'; '.join(ents['investigations']) or 'None'}",
         f"Prescribed Medications ({len(ents['medications'])}): " + ("; ".join(med_summaries) or "None"),
